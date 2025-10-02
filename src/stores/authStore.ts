@@ -210,4 +210,3 @@ export const useAuthStore = create<AuthState>()(
     }
   )
 )
-fix: Corrige bug do loading infinito no AuthStore
