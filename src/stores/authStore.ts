@@ -31,6 +31,10 @@ interface AuthState {
   initializeAuthListener: () => void;
 }
 
+// Criamos a "trava" fora do store para que ela não seja reativa.
+// Sua única função é controlar a execução da função checkAuth.
+let isCheckingAuth = false;
+
 export const useAuthStore = create<AuthState>()(
   persist(
     (set, get) => ({
@@ -39,18 +43,17 @@ export const useAuthStore = create<AuthState>()(
       currentChurchId: null,
 
       login: async (email: string, password: string) => {
-        console.log('AuthStore: Attempting login (this method should ideally not be called directly for Supabase auth).');
         set({ isLoading: true });
         try {
           const { data, error } = await supabase.auth.signInWithPassword({ email, password });
           if (error) {
             console.error('AuthStore: Supabase signInWithPassword error:', error.message);
-            set({ user: null, isLoading: false, currentChurchId: null });
             return false;
           }
           if (data.user) {
             console.log('AuthStore: Supabase signInWithPassword successful, user:', data.user.id);
-            await get().checkAuth(); // Force checkAuth after successful login
+            // checkAuth já tem sua própria trava, então é seguro chamar aqui.
+            await get().checkAuth(); 
             return true;
           }
         } catch (err) {
@@ -80,23 +83,29 @@ export const useAuthStore = create<AuthState>()(
       },
 
       checkAuth: async () => {
+        // Se uma verificação já está em andamento, esta nova chamada será ignorada.
+        if (isCheckingAuth) {
+          console.log('AuthStore: checkAuth call ignored, already in progress.');
+          return;
+        }
+
         console.log('AuthStore: checkAuth initiated. Setting isLoading to true.');
         set({ isLoading: true });
+        isCheckingAuth = true; // Ativa a trava para bloquear novas chamadas
+
         try {
           const { data: { session }, error } = await supabase.auth.getSession();
           console.log('AuthStore: getSession result - session:', session, 'error:', error);
 
           if (error) {
-            console.error('AuthStore: Error getting session:', error.message);
-            set({ user: null, isLoading: false, currentChurchId: null });
-            return;
+            throw error; // Joga o erro para o bloco catch
           }
 
           if (session && session.user) {
             console.log('AuthStore: Session found for user ID:', session.user.id);
             
             // Verificar se é um Super Admin
-            let { data: superAdminProfile, error: superAdminError } = await supabase
+            let { data: superAdminProfile } = await supabase
               .from('super_admins')
               .select('id, nome_completo, email')
               .eq('id', session.user.id)
@@ -112,81 +121,58 @@ export const useAuthStore = create<AuthState>()(
                   role: 'super_admin',
                   churchId: null,
                   churchName: 'Painel Master',
-                  ministry: null,
+                  ministry: undefined, // Corrigido para undefined se não aplicável
                   status: 'ativo',
                   created_at: session.user.created_at,
-                  perfil_completo: true, // Super Admins não precisam completar perfil
+                  perfil_completo: true,
                 },
-                isLoading: false,
                 currentChurchId: null,
               });
-              return;
+              // Não precisa mais do "return" aqui, pois o finally cuidará do resto
+            } else {
+              // Se não for Super Admin, buscar perfil normal
+              console.log('AuthStore: Attempting to fetch profile from "membros" table.');
+              let { data: profile, error: profileError } = await supabase
+                .from('membros')
+                .select(`id, nome_completo, email, funcao, id_igreja, status, created_at, perfil_completo, ministerio_recomendado, igrejas(id, nome)`)
+                .eq('id', session.user.id)
+                .maybeSingle();
+              
+              console.log('AuthStore: Profile fetch result - data:', profile, 'error:', profileError);
+
+              if (profileError) throw profileError;
+              if (!profile) throw new Error('Perfil de membro não encontrado.');
+
+              console.log('AuthStore: Profile data successfully fetched. perfil_completo:', profile.perfil_completo);
+
+              set({
+                user: {
+                  id: session.user.id,
+                  name: profile.nome_completo,
+                  email: session.user.email!,
+                  role: profile.funcao as UserRole, // Adicionado um type assertion
+                  churchId: profile.id_igreja,
+                  churchName: profile.igrejas?.nome || 'Igreja não encontrada',
+                  ministry: profile.ministerio_recomendado,
+                  status: profile.status as 'ativo' | 'pendente' | 'inativo', // Adicionado um type assertion
+                  created_at: profile.created_at,
+                  perfil_completo: profile.perfil_completo,
+                },
+                currentChurchId: profile.id_igreja,
+              });
             }
-
-            // Se não for Super Admin, buscar perfil normal
-            console.log('AuthStore: Attempting to fetch profile from "membros" table.');
-            let { data: profile, error: profileError } = await supabase
-              .from('membros') 
-              .select(`
-                id,
-                nome_completo,
-                email,
-                funcao,
-                id_igreja,
-                status,
-                created_at,
-                perfil_completo,
-                ministerio_recomendado,
-                igrejas(id, nome)
-              `)
-              .eq('id', session.user.id)
-              .maybeSingle(); 
-            
-            console.log('AuthStore: Profile fetch result - data:', profile, 'error:', profileError);
-
-            if (profileError || !profile) { 
-              console.error('AuthStore: Error fetching user profile or profile not found:', profileError?.message || 'Profile data is null/undefined.');
-              set({ user: null, isLoading: false, currentChurchId: null });
-              return;
-            }
-
-            console.log('AuthStore: Profile data successfully fetched. perfil_completo:', profile.perfil_completo);
-
-            set({
-              user: {
-                id: session.user.id,
-                name: profile.nome_completo,
-                email: session.user.email!,
-                role: profile.funcao,
-                churchId: profile.id_igreja,
-                churchName: profile.igrejas?.nome || 'Igreja não encontrada',
-                ministry: profile.ministerio_recomendado,
-                status: profile.status,
-                created_at: profile.created_at,
-                perfil_completo: profile.perfil_completo,
-              },
-              isLoading: false,
-              currentChurchId: profile.id_igreja,
-            });
-            console.log('AuthStore: User set:', {
-              id: session.user.id,
-              name: profile.nome_completo,
-              email: session.user.email!,
-              role: profile.funcao,
-              churchId: profile.id_igreja,
-              churchName: profile.igrejas?.nome || 'Igreja não encontrada',
-              ministry: profile.ministerio_recomendado,
-              status: profile.status,
-              created_at: profile.created_at,
-              perfil_completo: profile.perfil_completo,
-            });
           } else {
-            console.log('AuthStore: No authenticated user found in session. Setting isLoading to false.');
-            set({ user: null, isLoading: false, currentChurchId: null });
+            console.log('AuthStore: No authenticated user found in session.');
+            set({ user: null, currentChurchId: null });
           }
         } catch (error) {
           console.error('AuthStore: Unexpected error during checkAuth:', error);
-          set({ user: null, isLoading: false, currentChurchId: null }); 
+          set({ user: null, currentChurchId: null });
+        } finally {
+          // Este bloco é executado SEMPRE, com ou sem erro, garantindo que o estado seja limpo.
+          console.log('AuthStore: checkAuth finished. Releasing lock and setting isLoading to false.');
+          isCheckingAuth = false; // Libera a trava
+          set({ isLoading: false }); // Finaliza o loading
         }
       },
 
@@ -196,27 +182,32 @@ export const useAuthStore = create<AuthState>()(
       },
 
       initializeAuthListener: () => {
+        // Usando uma propriedade interna do 'get' para evitar múltiplas inicializações
         if (!(get() as any)._authListenerInitialized) {
           console.log('AuthStore: Initializing Supabase auth state listener.');
-          const { data: { subscription } } = supabase.auth.onAuthStateChange(
+          supabase.auth.onAuthStateChange(
             async (event, session) => {
-              console.log('AuthStore: Supabase Auth State Change Event:', event, session);
+              console.log('AuthStore: Supabase Auth State Change Event:', event, session?.user?.id);
+              // Simplificado para chamar checkAuth na maioria dos eventos positivos
               if (event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
                 console.log('AuthStore: Auth event detected, calling checkAuth().');
-                await (get() as any).checkAuth();
+                await get().checkAuth();
               } else if (event === 'SIGNED_OUT') {
                 console.log('AuthStore: SIGNED_OUT event detected, clearing state.');
                 set({ user: null, currentChurchId: null, isLoading: false });
               }
             }
           );
-          (get() as any)._authListenerInitialized = true;
+          // Marca o listener como inicializado
+          set({ _authListenerInitialized: true } as Partial<AuthState>);
         }
       }
     }),
     {
       name: 'connect-vida-auth',
+      // Persiste apenas o ID da igreja, o que é uma excelente prática.
       partialize: (state) => ({ currentChurchId: state.currentChurchId }),
     }
   )
 )
+fix: Corrige bug do loading infinito no AuthStore
